@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -104,3 +105,29 @@ def test_astrbot_history_fallback_stops_at_10k_text_tokens():
     messages = front_desk._convert_astrbot_history_to_angelheart_format(history, 19)
 
     assert [msg["content"] for msg in messages] == ["最新消息"]
+
+
+def test_whatsapp_group_does_not_enter_qq_history_path():
+    front_desk = _front_desk()
+    calls = {"qq": 0, "fallback": 0}
+
+    async def fetch_qq(*_args):
+        calls["qq"] += 1
+        return []
+
+    async def fetch_fallback(*_args):
+        calls["fallback"] += 1
+        return [{"role": "user", "content": "history"}]
+
+    front_desk._fetch_qq_history = fetch_qq
+    front_desk._fetch_astrbot_conversation_history = fetch_fallback
+    event = types.SimpleNamespace(get_platform_name=lambda: "whatsapp")
+
+    result = asyncio.run(
+        front_desk._fetch_database_history(
+            "whatsapp:GroupMessage:group@g.us", 7, event
+        )
+    )
+
+    assert result == [{"role": "user", "content": "history"}]
+    assert calls == {"qq": 0, "fallback": 1}

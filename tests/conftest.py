@@ -30,7 +30,8 @@ class Image:
 
 
 class Plain:
-    pass
+    def __init__(self, text=""):
+        self.text = text
 
 
 class Reply:

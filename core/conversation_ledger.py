@@ -1,12 +1,15 @@
+import asyncio
 import time
 import threading
 import sqlite3
 import aiohttp
 import io
 import base64
+import os
 from PIL import Image
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from urllib.parse import unquote, urlparse
 from . import utils
 
 # 条件导入：当缺少astrbot依赖时使用Mock
@@ -29,6 +32,7 @@ class ConversationLedger:
         self._db_lock = threading.Lock()
         # 每个 chat_id 对应一个独立的账本
         self._ledgers: Dict[str, Dict] = {}
+        self._caption_locks: Dict[str, asyncio.Lock] = {}
         self.config_manager = config_manager
         self.astr_context = astr_context
 
@@ -60,9 +64,8 @@ class ConversationLedger:
                     timestamp REAL NOT NULL
                 )
             """)
-            # 新的 内容哈希 缓存表 (dHash)
-            # 重新建表以确保 Schema 匹配 dHash 格式
-            self.db_cursor.execute("DROP TABLE IF EXISTS image_content_cache")
+            # 内容哈希缓存必须跨插件重载/容器重启保留；只在旧表结构确实
+            # 不兼容时重建，正常启动不再无条件清空缓存。
             self.db_cursor.execute("""
                 CREATE TABLE IF NOT EXISTS image_content_cache (
                     dhash TEXT PRIMARY KEY,
@@ -70,6 +73,22 @@ class ConversationLedger:
                     timestamp REAL NOT NULL
                 )
             """)
+            columns = {
+                row[1]
+                for row in self.db_cursor.execute(
+                    "PRAGMA table_info(image_content_cache)"
+                ).fetchall()
+            }
+            if columns != {"dhash", "caption", "timestamp"}:
+                logger.warning("AngelHeart: 检测到不兼容的图片缓存表，正在重建")
+                self.db_cursor.execute("DROP TABLE image_content_cache")
+                self.db_cursor.execute("""
+                    CREATE TABLE image_content_cache (
+                        dhash TEXT PRIMARY KEY,
+                        caption TEXT NOT NULL,
+                        timestamp REAL NOT NULL
+                    )
+                """)
             self.db_conn.commit()
         logger.info(f"AngelHeart: 图片转述缓存数据库已初始化于 {db_path}")
 
@@ -113,28 +132,40 @@ class ConversationLedger:
     async def _load_image_bytes(self, url: str) -> bytes:
         """从本地文件、网络地址或 data URL 读取图片原始字节。"""
         try:
+            path = ""
             if url.startswith("file:///"):
-                import os
-                path = url[8:]
-
-                if '..' in path or path.startswith('/etc') or path.startswith('/sys'):
-                    logger.warning(f"拒绝访问受限路径: {path}")
-                    return b""
+                path = unquote(urlparse(url).path)
 
                 if os.name == 'nt' and len(path) > 2 and path[1] == ':':
                     pass
                 elif os.name == 'nt' and path.startswith('/'):
                     path = path[1:]
 
-                if not os.path.exists(path):
-                    logger.warning(f"本地文件不存在: {path}")
+            elif os.path.isabs(url) or os.path.exists(url):
+                path = url
+
+            if path:
+                path_obj = Path(path)
+                try:
+                    resolved_path = path_obj.resolve(strict=False)
+                except Exception:
+                    logger.warning(f"本地图片路径解析失败: {path}")
                     return b""
 
-                if os.path.getsize(path) > 10 * 1024 * 1024:
-                    logger.warning(f"文件过大，拒绝处理: {path}")
+                restricted_prefixes = [Path('/etc'), Path('/sys'), Path('/proc'), Path('/dev')]
+                if any(resolved_path == prefix or prefix in resolved_path.parents for prefix in restricted_prefixes):
+                    logger.warning(f"拒绝访问受限路径: {resolved_path}")
                     return b""
 
-                with open(path, "rb") as f:
+                if not resolved_path.is_file():
+                    logger.warning(f"本地文件不存在: {resolved_path}")
+                    return b""
+
+                if resolved_path.stat().st_size > 10 * 1024 * 1024:
+                    logger.warning(f"文件过大，拒绝处理: {resolved_path}")
+                    return b""
+
+                with resolved_path.open("rb") as f:
                     return f.read()
 
             if url.startswith("http"):
@@ -159,6 +190,45 @@ class ConversationLedger:
         except Exception as e:
             logger.warning(f"读取图片异常: {e}, URL: {url}")
             return b""
+
+    def _is_existing_local_image_ref(self, url: str) -> bool:
+        """判断本地图片引用当前是否仍可读取。"""
+        try:
+            if url.startswith("file:///"):
+                path = unquote(urlparse(url).path)
+                if os.name == 'nt' and len(path) > 2 and path[1] == ':':
+                    pass
+                elif os.name == 'nt' and path.startswith('/'):
+                    path = path[1:]
+                return Path(path).is_file()
+            if os.path.isabs(url) or os.path.exists(url):
+                return Path(url).is_file()
+        except Exception:
+            return False
+        return False
+
+    def _collect_image_caption_sources(self, item: Dict) -> List[str]:
+        """按可靠性收集图片转述候选源，临时文件失效时回退到 data URL。"""
+        sources: List[str] = []
+
+        def add(value: str | None):
+            if value and value != "[IMAGE_PLACEHOLDER]" and value not in sources:
+                sources.append(value)
+
+        image_url = item.get("image_url", {})
+        embedded_url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+        original_url = item.get("original_url") or item.get("original_file_url")
+
+        if original_url:
+            if original_url.startswith("http") or self._is_existing_local_image_ref(original_url):
+                add(original_url)
+            elif embedded_url.startswith("data:image"):
+                logger.debug(
+                    "图片原始本地路径已失效，回退使用消息内嵌 data URL 进行转述"
+                )
+
+        add(embedded_url)
+        return sources
 
     def _build_caption_image_data_url(
         self,
@@ -408,22 +478,72 @@ class ConversationLedger:
             for message in ledger["messages"]:
                 if abs(message.get("timestamp", 0) - message_timestamp) < 0.001:  # 处理浮点数精度
                     message["image_caption"] = caption
+                    message.pop("_image_caption_temporary", None)
+                    message.pop("_image_caption_retry_after", None)
                     image_refs = self._extract_image_refs_from_content(message.get("content"))
                     if image_refs:
                         message["image_refs"] = image_refs
 
-                    # 转述成功后，清空图片URL避免重复转述
-                    if isinstance(message.get("content"), list):
-                        # 移除所有 image_url 组件
-                        message["content"] = [
-                            item for item in message["content"]
-                            if item.get("type") != "image_url"
-                        ]
-                        logger.debug(f"AngelHeart[{chat_id}]: 已清空图片URL，避免重复转述")
+                    # 同时保留图片和转述：最终 Provider 若支持图片可直接看图，
+                    # 若为纯文本模型则由 AstrBot 清洗图片并保留转述文本。
+                    # image_caption 字段本身负责避免下一轮重复调用转述模型。
 
                     logger.debug(f"AngelHeart[{chat_id}]: 已为消息添加图片转述: {caption[:50]}...")
                     return True
             return False
+
+    def _mark_temporary_caption_failure(
+        self, chat_id: str, message_timestamp: float
+    ) -> bool:
+        """写入可重试的文字兜底，避免同一轮重复请求和纯文本模型信息丢失。"""
+        ledger = self._get_or_create_ledger(chat_id)
+        retry_after = time.time() + self.config_manager.image_caption_retry_cooldown
+        with self._lock:
+            for message in ledger["messages"]:
+                if abs(message.get("timestamp", 0) - message_timestamp) < 0.001:
+                    message["image_caption"] = self.TEMPORARY_IMAGE_CAPTION
+                    message["_image_caption_temporary"] = True
+                    message["_image_caption_retry_after"] = retry_after
+                    image_refs = self._extract_image_refs_from_content(
+                        message.get("content")
+                    )
+                    if image_refs:
+                        message["image_refs"] = image_refs
+                    return True
+        return False
+
+    async def _request_image_caption(
+        self,
+        caption_provider_id: str,
+        astr_context,
+        prompt: str,
+        image_url: str,
+    ):
+        """短超时调用转述模型；Provider 热重载时重新解析一次实例。"""
+        timeout = self.config_manager.image_caption_timeout
+        last_error = None
+        for attempt in range(2):
+            provider = astr_context.get_provider_by_id(caption_provider_id)
+            if not provider:
+                raise RuntimeError(f"图片转述 Provider 不存在: {caption_provider_id}")
+            try:
+                return await asyncio.wait_for(
+                    provider.text_chat(
+                        prompt=prompt,
+                        image_urls=[image_url],
+                        request_max_retries=1,
+                    ),
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                last_error = exc
+                # 仅对 Provider 正在热重载导致的失效 client 做一次快速重取；
+                # 503、超时等交给冷却机制，避免阻塞会话数分钟。
+                if attempt == 0 and "NoneType" in str(exc) and "models" in str(exc):
+                    await asyncio.sleep(0.2)
+                    continue
+                raise
+        raise last_error or RuntimeError("图片转述调用失败")
 
     def _extract_image_refs_from_content(self, content) -> List[str]:
         """从消息 content 中提取可用于展示的图片引用路径。"""
@@ -453,6 +573,86 @@ class ConversationLedger:
         return refs
 
     async def generate_captions_for_chat(self, chat_id: str, caption_provider_id: str, astr_context=None) -> int:
+        """同一会话只允许一个图片转述任务运行。"""
+        if not hasattr(self, "_caption_locks"):
+            self._caption_locks = {}
+        lock = self._caption_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            return await self._generate_captions_for_chat_unlocked(
+                chat_id, caption_provider_id, astr_context
+            )
+
+    async def _caption_one_image(
+        self,
+        chat_id: str,
+        source_candidates: List[str],
+        caption_provider_id: str,
+        astr_context,
+        prompt: str,
+        semaphore: asyncio.Semaphore,
+    ) -> str:
+        """转述单张图片；多种来源只作为同一图片的读取回退。"""
+        raw_image_data = b""
+        target_url = ""
+        for source in source_candidates:
+            raw_image_data = await self._load_image_bytes(source)
+            if raw_image_data:
+                target_url = source
+                break
+
+        if not raw_image_data:
+            raise RuntimeError("图片下载失败或内容为空")
+
+        img_dhash = self._compute_dhash(raw_image_data)
+        if img_dhash:
+            with self._db_lock:
+                self.db_cursor.execute(
+                    "SELECT caption FROM image_content_cache WHERE dhash = ?",
+                    (img_dhash,),
+                )
+                result = self.db_cursor.fetchone()
+            if result and result[0]:
+                logger.info(
+                    f"AngelHeart[{chat_id}]: 图片转述缓存命中 "
+                    f"(dHash: {img_dhash}): {target_url[:50]}..."
+                )
+                return str(result[0]).strip()
+
+        caption_input_url = self._build_caption_image_data_url(raw_image_data)
+        if not caption_input_url:
+            caption_input_url = self._build_original_image_data_url(raw_image_data)
+        if not caption_input_url:
+            raise RuntimeError("无法构建可用的图片 data URL")
+
+        async with semaphore:
+            llm_resp = await self._request_image_caption(
+                caption_provider_id,
+                astr_context,
+                prompt,
+                caption_input_url,
+            )
+        final_caption = (
+            llm_resp.completion_text.strip()
+            if llm_resp and isinstance(llm_resp.completion_text, str)
+            else ""
+        )
+        if not final_caption:
+            raise RuntimeError("图片转述返回空结果")
+
+        if img_dhash:
+            try:
+                with self._db_lock:
+                    self.db_cursor.execute(
+                        "INSERT OR REPLACE INTO image_content_cache "
+                        "(dhash, caption, timestamp) VALUES (?, ?, ?)",
+                        (img_dhash, final_caption, time.time()),
+                    )
+                    self.db_conn.commit()
+            except sqlite3.IntegrityError:
+                logger.debug("图片转述缓存写入冲突，已忽略")
+        return final_caption
+
+    async def _generate_captions_for_chat_unlocked(self, chat_id: str, caption_provider_id: str, astr_context=None) -> int:
         """
         为指定会话中的所有未转述图片生成转述
 
@@ -468,21 +668,18 @@ class ConversationLedger:
             logger.warning(f"AngelHeart[{chat_id}]: astr_context 为空，无法进行图片转述")
             return 0
 
-        # 获取转述Provider
-        caption_provider = astr_context.get_provider_by_id(caption_provider_id)
-        if not caption_provider:
+        if not astr_context.get_provider_by_id(caption_provider_id):
             logger.error(f"AngelHeart[{chat_id}]: 无法找到图片转述Provider: {caption_provider_id}")
             return 0
 
-        # 获取配置
-        try:
-            img_cap_prompt = "这是一张群聊图片，根据情景准确描述该图片"
-        except Exception as e:
-            logger.error(f"AngelHeart[{chat_id}]: 获取配置失败: {e}")
-            return 0
+        img_cap_prompt = getattr(
+            self.config_manager,
+            "image_caption_prompt",
+            "请准确转述这张图片供纯文字主模型理解。",
+        )
 
         ledger = self._get_or_create_ledger(chat_id)
-        processed_count = 0
+        success_count = 0
 
         with self._lock:
             # 确定最近 7 条消息的时间戳边界
@@ -494,9 +691,12 @@ class ConversationLedger:
             messages_needing_caption = []
             expired_messages = []
             for message in all_messages:
+                retry_after = float(message.get("_image_caption_retry_after", 0) or 0)
+                caption_is_temporary = bool(message.get("_image_caption_temporary"))
+                needs_caption = not message.get("image_caption") or caption_is_temporary
                 if (message.get("role") == "user" and
                     isinstance(message.get("content"), list) and
-                    not message.get("image_caption")):
+                    needs_caption and retry_after <= time.time()):
 
                     has_image = any(item.get("type") == "image_url" for item in message["content"])
                     if has_image:
@@ -508,12 +708,13 @@ class ConversationLedger:
             # 不在最近 7 条消息范围内的图片直接标记过期
             for msg in expired_messages:
                 msg["image_caption"] = self.EXPIRED_IMAGE_CAPTION
+                msg.pop("_image_caption_temporary", None)
+                msg.pop("_image_caption_retry_after", None)
                 if isinstance(msg.get("content"), list):
                     msg["content"] = [
                         item for item in msg["content"]
                         if item.get("type") != "image_url"
                     ]
-                processed_count += 1
 
             if expired_messages:
                 logger.info(
@@ -522,142 +723,66 @@ class ConversationLedger:
 
             logger.info(f"AngelHeart[{chat_id}]: 找到 {len(messages_needing_caption)} 条需要转述图片的消息")
 
-        # 逐一处理需要转述的消息（在锁外进行异步操作）
+        # 逐一处理消息；同一条消息的多张图片并行转述，限制并发避免冲击 Provider。
         for message in messages_needing_caption:
             try:
-                # 提取图片URL - 优先使用原始URL，避免base64数据过长
-                image_urls = []
+                image_source_groups = []
                 for item in message["content"]:
                     if item.get("type") == "image_url":
-                        # 优先使用原始URL
-                        original_url = item.get("original_url")
-                        if original_url and original_url != "[IMAGE_PLACEHOLDER]":
-                            image_urls.append(original_url)
-                            logger.debug(f"AngelHeart[{chat_id}]: 使用原始URL进行转述: {original_url[:100]}...")
-                        else:
-                            # 回退到base64数据URL
-                            image_url = item.get("image_url", {}).get("url", "")
-                            if image_url and not image_url.startswith("data:"):
-                                image_urls.append(image_url)
+                        sources = self._collect_image_caption_sources(item)
+                        if sources:
+                            image_source_groups.append(sources)
 
-                if image_urls:
-                    # 我们只处理第一张图片的URL作为缓存键
-                    target_url = image_urls[0]
-                    final_caption = ""
-                    img_dhash = ""
-                    raw_image_data = b""
-
-                    # 1. 下载图片并计算 dHash
-                    raw_image_data = await self._load_image_bytes(target_url)
-
-                    if not raw_image_data:
-                        logger.warning(
-                            f"AngelHeart[{chat_id}]: 图片下载失败或内容为空，跳过转述: {target_url[:100]}..."
-                        )
-                        if not self._apply_broken_image_caption(
-                            chat_id,
-                            message["timestamp"],
-                        ):
-                            logger.warning(
-                                f"AngelHeart[{chat_id}]: 无法为坏图写入降级转述"
-                            )
-                        else:
-                            processed_count += 1
-                        continue
-
-                    img_dhash = self._compute_dhash(raw_image_data)
-
-                    # 2. 查询 SQLite dHash 缓存（在锁保护下执行）
-                    if img_dhash:
-                        with self._db_lock:
-                            self.db_cursor.execute("SELECT caption FROM image_content_cache WHERE dhash = ?", (img_dhash,))
-                            result = self.db_cursor.fetchone()
-
-                        if result:
-                            final_caption = result[0]
-                            logger.info(f"AngelHeart[{chat_id}]: 图片转述缓存命中 (dHash: {img_dhash}): {target_url[:50]}...")
-
-                    if not final_caption:
-                        # 3. 缓存未命中，调用 LLM
-                        logger.debug(f"AngelHeart[{chat_id}]: 缓存未命中(dHash: {img_dhash})，调用LLM转述URL: {target_url[:50]}...")
-                        caption_input_url = self._build_caption_image_data_url(raw_image_data)
-                        if caption_input_url:
-                            logger.debug(
-                                f"AngelHeart[{chat_id}]: 转述图片已压缩为 WEBP(quality=75, max_side=960)"
-                            )
-                        else:
-                            caption_input_url = self._build_original_image_data_url(raw_image_data)
-                            if caption_input_url:
-                                logger.debug(
-                                    f"AngelHeart[{chat_id}]: 压缩图片失败，回退使用原始 data URL 进行转述"
-                                )
-
-                        if not caption_input_url:
-                            logger.warning(
-                                f"AngelHeart[{chat_id}]: 无法构建可用的图片 data URL，写入降级转述"
-                            )
-                            if not self._apply_broken_image_caption(
+                if image_source_groups:
+                    semaphore = asyncio.Semaphore(min(3, len(image_source_groups)))
+                    captions = await asyncio.gather(
+                        *(
+                            self._caption_one_image(
                                 chat_id,
-                                message["timestamp"],
-                            ):
-                                logger.warning(
-                                    f"AngelHeart[{chat_id}]: 无法为不可编码图片写入降级转述"
-                                )
-                            else:
-                                processed_count += 1
-                            continue
-
-                        llm_resp = await caption_provider.text_chat(
-                            prompt=img_cap_prompt,
-                            image_urls=[caption_input_url],
+                                sources,
+                                caption_provider_id,
+                                astr_context,
+                                img_cap_prompt,
+                                semaphore,
+                            )
+                            for sources in image_source_groups
                         )
-
-                        if llm_resp and llm_resp.completion_text:
-                            final_caption = llm_resp.completion_text.strip()
-
-                            # 4. 结果存入 SQLite dHash 缓存（在锁保护下执行）
-                            if img_dhash:
-                                try:
-                                    with self._db_lock:
-                                        self.db_cursor.execute(
-                                            "INSERT OR REPLACE INTO image_content_cache (dhash, caption, timestamp) VALUES (?, ?, ?)",
-                                            (img_dhash, final_caption, time.time())
-                                        )
-                                        self.db_conn.commit()
-                                    logger.info(f"AngelHeart[{chat_id}]: 新图片转述已缓存 (dHash: {img_dhash}): {target_url[:50]}...")
-                                except sqlite3.IntegrityError:
-                                    logger.debug(f"AngelHeart[{chat_id}]: 缓存写入冲突，已忽略")
-                            else:
-                                logger.warning(f"AngelHeart[{chat_id}]: 图片dHash为空，无法写入缓存")
-                        else:
-                            logger.warning(f"AngelHeart[{chat_id}]: 图片转述返回空结果")
-                            if not self._apply_broken_image_caption(
-                                chat_id,
-                                message["timestamp"],
-                            ):
-                                logger.warning(
-                                    f"AngelHeart[{chat_id}]: 无法为空转述结果写入降级转述"
-                                )
-                            else:
-                                processed_count += 1
-
-                    # 5. 将最终的转述结果（来自缓存或LLM）添加到消息中
-                    if final_caption:
-                        if self.add_caption_to_message(chat_id, message["timestamp"], final_caption):
-                            processed_count += 1
-                            logger.info(f"AngelHeart[{chat_id}]: 图片转述成功: {final_caption[:50]}...")
-                        else:
-                            logger.warning(f"AngelHeart[{chat_id}]: 无法为消息添加转述结果")
+                    )
+                    final_caption = captions[0] if len(captions) == 1 else "\n\n".join(
+                        f"[图片{index}]\n{caption}"
+                        for index, caption in enumerate(captions, start=1)
+                    )
+                    if self.add_caption_to_message(
+                        chat_id, message["timestamp"], final_caption
+                    ):
+                        success_count += len(captions)
+                        logger.info(
+                            f"AngelHeart[{chat_id}]: 图片转述成功，共 {len(captions)} 张"
+                        )
+                    else:
+                        logger.warning(f"AngelHeart[{chat_id}]: 无法为消息添加转述结果")
+                else:
+                    logger.warning(
+                        f"AngelHeart[{chat_id}]: 图片消息没有可用的源地址，保留原图回退"
+                    )
+                    self._mark_temporary_caption_failure(
+                        chat_id, message["timestamp"]
+                    )
 
             except Exception as e:
-                logger.error(f"AngelHeart[{chat_id}]: 图片转述失败: {e}")
-                # 继续处理下一张图片
+                self._mark_temporary_caption_failure(chat_id, message["timestamp"])
+                error_name = type(e).__name__
+                error_text = str(e).strip() or "无详细信息"
+                logger.warning(
+                    f"AngelHeart[{chat_id}]: 图片转述暂时失败，已写入文字兜底并进入冷却: "
+                    f"{error_name}: {error_text}"
+                )
                 continue
 
-        if processed_count > 0:
-            logger.info(f"AngelHeart[{chat_id}]: 图片转述完成，共处理 {processed_count} 张图片")
+        if success_count > 0:
+            logger.info(f"AngelHeart[{chat_id}]: 图片转述完成，成功生成 {success_count} 条转述")
 
-        return processed_count
+        return success_count
 
     def should_process_images(self, chat_id: str, astr_context=None) -> bool:
         """
@@ -677,9 +802,14 @@ class ConversationLedger:
 
             has_images_needing_caption = False
             for message in all_messages:
-                if (message.get("role") == "user" and  # 只检查用户消息
+                retry_after = float(message.get("_image_caption_retry_after", 0) or 0)
+                needs_caption = (
+                    not message.get("image_caption")
+                    or message.get("_image_caption_temporary")
+                )
+                if (message.get("role") == "user" and
                     isinstance(message.get("content"), list) and
-                    not message.get("image_caption")):  # 还没有转述
+                    needs_caption and retry_after <= time.time()):
 
                     # 检查是否包含图片
                     has_image = any(item.get("type") == "image_url" for item in message["content"])
@@ -697,7 +827,12 @@ class ConversationLedger:
                     current_provider = astr_context.get_using_provider(chat_id)
                     if current_provider:
                         modalities = current_provider.provider_config.get("modalities", None)
-                        if not modalities or not isinstance(modalities, list) or "image" in modalities:
+                        # 与 AstrBot 4.27.2 核心保持一致：迁移遗留的空列表按
+                        # “未配置但兼容”处理；字段缺失/None 则能力未知，仍生成
+                        # 文字转述，同时保留原图交给核心选择最终 Provider。
+                        if modalities == [] or (
+                            isinstance(modalities, list) and "image" in modalities
+                        ):
                             logger.debug(f"AngelHeart[{chat_id}]: 当前Provider支持图片，无需转述")
                             return False
                 except Exception:
@@ -1078,3 +1213,4 @@ class ConversationLedger:
         return int(tokens) + (1 if tokens % 1 > 0 else 0)
     BROKEN_IMAGE_CAPTION = "图裂了，图片无法打开，可能是网络问题或者格式不支持"
     EXPIRED_IMAGE_CAPTION = "因为时间问题，图片缓存内容已经丢失"
+    TEMPORARY_IMAGE_CAPTION = "图片转述服务暂时不可用；原图仍保留，支持图片的模型请直接查看。"
