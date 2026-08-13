@@ -87,6 +87,18 @@ class AngelHeartPlugin(Star):
         # 如果是需要处理的消息，则委托给前台缓存
         await self.front_desk.handle_event(event)
 
+        # AstrBot 会在 on_llm_request 之前按 image_urls 选择多模态 fallback。
+        # 因此 AngelHeart 必须在事件阶段先完成图转文，并只对本次主请求移除原图。
+        if not event.is_stopped() and event.is_at_or_wake_command:
+            await self.front_desk.prepare_current_image_for_text_model(event)
+
+    @filter.on_llm_request(priority=10000)
+    async def restore_image_event_after_request_built(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """请求已经文本化并选好主模型后，恢复供其他插件读取的原始事件。"""
+        self.front_desk.restore_original_image_event(event)
+
     @filter.on_llm_request(priority=0)  # 默认优先级
     async def inject_oneshot_decision_on_llm_request(
         self, event: AstrMessageEvent, req: ProviderRequest

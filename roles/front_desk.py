@@ -257,6 +257,164 @@ class FrontDesk:
         # 7. 将消息添加到 Ledger。上下文清理由压缩策略统一控制，不再因离场状态触发。
         self.context.conversation_ledger.add_message(chat_id, new_message)
 
+    def _get_event_stored_image_caption(self, chat_id: str, event_id: str) -> str:
+        """读取当前事件写入 AngelHeart 总账的原始图片转述。"""
+        if not event_id:
+            return ""
+
+        ledger = self.context.conversation_ledger
+        messages = ledger.get_all_messages(chat_id)
+        for message in reversed(messages):
+            if str(message.get("source_event_id", "") or "") != event_id:
+                continue
+            caption = message.get("image_caption", "")
+            if not isinstance(caption, str):
+                return ""
+            return caption.strip()
+        return ""
+
+    def _get_event_image_caption(self, chat_id: str, event_id: str) -> str:
+        """读取当前事件完整且可交给文本模型的成功图片转述。"""
+        caption = self._get_event_stored_image_caption(chat_id, event_id)
+        if not caption:
+            return ""
+
+        ledger = self.context.conversation_ledger
+        messages = ledger.get_all_messages(chat_id)
+        for message in reversed(messages):
+            if str(message.get("source_event_id", "") or "") != event_id:
+                continue
+            degraded_captions = {
+                str(getattr(ledger, "TEMPORARY_IMAGE_CAPTION", "") or "").strip(),
+                str(getattr(ledger, "BROKEN_IMAGE_CAPTION", "") or "").strip(),
+                str(getattr(ledger, "EXPIRED_IMAGE_CAPTION", "") or "").strip(),
+            }
+            if (
+                not caption
+                or message.get("_image_caption_temporary")
+                or caption in degraded_captions
+            ):
+                return ""
+            return caption
+        return ""
+
+    def restore_original_image_event(self, event: AstrMessageEvent) -> bool:
+        """在 ProviderRequest 建立后恢复共享事件，避免影响其他插件。"""
+        if not hasattr(event, "get_extra"):
+            return False
+        snapshot = event.get_extra("angelheart_original_image_event")
+        if not isinstance(snapshot, dict):
+            return False
+
+        original_chain = snapshot.get("message_chain")
+        if isinstance(original_chain, list):
+            event.message_obj.message = original_chain
+        event.message_str = snapshot.get("event_message_str", event.message_str)
+        if snapshot.get("had_message_obj_message_str"):
+            event.message_obj.message_str = snapshot.get(
+                "message_obj_message_str", event.message_str
+            )
+        event.set_extra("angelheart_original_image_event", None)
+        logger.debug(
+            f"AngelHeart[{event.unified_msg_origin}]: 已恢复共享事件中的原始图片。"
+        )
+        return True
+
+    async def prepare_current_image_for_text_model(
+        self, event: AstrMessageEvent
+    ) -> bool:
+        """在 AstrBot 选择主模型前，用 AngelHeart 转述并文本化当前图片。
+
+        原图继续保留在 ConversationLedger 中用于缓存与后续上下文；这里只修改
+        当前 AstrBot 事件的请求副本，避免核心因为 ``image_urls`` 把整轮对话
+        从路由选中的文本模型切换到多模态 fallback。
+        """
+        message_chain = list(event.get_messages() or [])
+        if not any(isinstance(component, Image) for component in message_chain):
+            return False
+
+        caption_provider_id = self._config_manager.image_caption_provider_id
+        if not caption_provider_id:
+            logger.warning(
+                f"AngelHeart[{event.unified_msg_origin}]: 当前消息包含图片，"
+                "但未配置 AngelHeart 图片转述模型。"
+            )
+            return False
+
+        chat_id = event.unified_msg_origin
+        event_id = self._get_event_message_id(event)
+        try:
+            await self.context.conversation_ledger.generate_captions_for_chat(
+                chat_id=chat_id,
+                caption_provider_id=caption_provider_id,
+                astr_context=self.astr_context,
+            )
+        except Exception as e:
+            logger.warning(f"AngelHeart[{chat_id}]: 主模型选择前图片转述失败: {e}")
+
+        caption = self._get_event_image_caption(chat_id, event_id)
+        caption_succeeded = bool(caption)
+        if caption_succeeded:
+            caption_text = f"[AngelHeart 图片转述]\n{caption}"
+        else:
+            logger.warning(
+                f"AngelHeart[{chat_id}]: 当前图片转述失败，本轮仍交给文字主模型处理。"
+            )
+            stored_caption = self._get_event_stored_image_caption(chat_id, event_id)
+            if not stored_caption:
+                stored_caption = str(
+                    getattr(
+                        self.context.conversation_ledger,
+                        "TEMPORARY_IMAGE_CAPTION",
+                        "图片转述服务暂时不可用。",
+                    )
+                )
+            caption_text = (
+                "[AngelHeart 图片转述]\n"
+                f"{stored_caption}"
+            )
+        text_before_caption = str(getattr(event, "message_str", "") or "").strip()
+        request_text = (
+            f"{text_before_caption}\n\n{caption_text}"
+            if text_before_caption
+            else caption_text
+        )
+
+        # 暂时修改事件，让 AstrBot 构建纯文字 ProviderRequest。请求建立后会在
+        # on_llm_request 的最高优先级钩子中恢复，避免影响其他插件。
+        if hasattr(event, "set_extra"):
+            event.set_extra(
+                "angelheart_original_image_event",
+                {
+                    "message_chain": message_chain,
+                    "event_message_str": getattr(event, "message_str", ""),
+                    "had_message_obj_message_str": hasattr(
+                        event.message_obj, "message_str"
+                    ),
+                    "message_obj_message_str": getattr(
+                        event.message_obj, "message_str", ""
+                    ),
+                },
+            )
+        event.message_obj.message = [
+            component
+            for component in message_chain
+            if not isinstance(component, Image)
+        ]
+        event.message_obj.message.append(Plain(caption_text))
+        event.message_str = request_text
+        if hasattr(event.message_obj, "message_str"):
+            event.message_obj.message_str = request_text
+        if hasattr(event, "set_extra"):
+            event.set_extra("angelheart_image_caption_preprocessed", True)
+
+        logger.info(
+            f"AngelHeart[{chat_id}]: 图片已在主模型选择前"
+            f"{'转为文字' if caption_succeeded else '替换为失败说明'}，"
+            "本轮继续使用路由选中的文字模型。"
+        )
+        return True
+
     async def handle_event(self, event: AstrMessageEvent):
         """
         处理新消息事件 - 集成4状态机制重构版
@@ -438,10 +596,20 @@ class FrontDesk:
 
         if result == "KILL":
             logger.debug(f"AngelHeart[{chat_id}]: 扣押消息被取消，离开")
-            # 产生空回复并停止事件传播
-            result_obj = event.get_result()
-            if result_obj:
-                result_obj.chain = []
+            # 清除结果而不是留下空消息链，避免 RespondStage 产生一次假的
+            # Prepare-to-send / after-message-sent 生命周期。
+            clear_result = getattr(event, "clear_result", None)
+            if callable(clear_result):
+                try:
+                    clear_result()
+                except Exception:
+                    result_obj = event.get_result()
+                    if result_obj:
+                        result_obj.chain = []
+            else:
+                result_obj = event.get_result()
+                if result_obj:
+                    result_obj.chain = []
             event.stop_event()
             return
         elif result == "PROCESS":
@@ -658,6 +826,16 @@ class FrontDesk:
                     await self._call_secretary_and_execute(event, chat_id)
                     return
 
+                # 这条消息在等待前已经写入总账。冷却边界的赢家会从同一总账
+                # 取得包含它的快照，因此普通群聊消息无需再创建一张会相互取消的
+                # 等候牌。显式 @ / 唤醒命令仍保留扣押语义，确保不会被合并掉。
+                if not event.is_at_or_wake_command:
+                    logger.debug(
+                        f"AngelHeart[{chat_id}]: 冷却边界已由另一事件接管，"
+                        "当前消息已并入总账，跳过重复扣押"
+                    )
+                    return
+
             # 如果是因为LOCKED，或者等待冷却后仍然LOCKED，才进入扣押队列
             logger.debug(f"AngelHeart[{chat_id}]: 门锁被占用 (原因: {reason})，进入扣押队列")
             await self._enter_detention_queue(event, f"门锁占用({reason})")
@@ -740,9 +918,15 @@ class FrontDesk:
         优先从 QQ API 获取历史消息；若失败或为空，则回退到 AstrBot 官方会话历史。
         """
         try:
-            if not self._is_group_chat(chat_id):
+            platform_name = ""
+            try:
+                platform_name = str(event.get_platform_name() or "").lower()
+            except Exception:
+                platform_name = ""
+
+            if not self._is_group_chat(chat_id) or platform_name != "aiocqhttp":
                 logger.debug(
-                    f"AngelHeart[{chat_id}]: 非群聊会话，直接从 AstrBot 官方会话历史补充"
+                    f"AngelHeart[{chat_id}]: 非 QQ 群会话，直接从 AstrBot 官方会话历史补充"
                 )
                 return await self._fetch_astrbot_conversation_history(chat_id, needed_count)
 
@@ -954,7 +1138,7 @@ class FrontDesk:
             if hasattr(event, "bot"):
                 return event.bot
             else:
-                logger.error("AngelHeart: event对象中没有bot实例")
+                logger.debug("AngelHeart: 当前事件没有 QQ bot 实例")
                 return None
         except Exception as e:
             logger.error(f"AngelHeart: 获取bot实例失败: {e}")
@@ -1042,109 +1226,12 @@ class FrontDesk:
     def filter_images_for_provider(
         self, chat_id: str, contexts: List[Dict]
     ) -> List[Dict]:
+        """保留原始多模态上下文，由 AstrBot 4.27 的最终 Provider 层统一清洗。
+
+        模型路由和图片 fallback 会改变本轮实际 Provider；插件若按会话默认模型
+        提前删图，会让已切换到视觉模型的请求也丢失图片。
         """
-        根据 Provider 的 modalities 配置过滤图片内容
-
-        Args:
-            chat_id: 聊天ID，用于获取当前使用的 provider
-            contexts: 消息上下文列表
-
-        Returns:
-            过滤后的消息上下文列表
-        """
-        try:
-            # 获取当前使用的 provider
-            provider = self.context.astr_context.get_using_provider(chat_id)
-            if not provider:
-                logger.debug(
-                    f"AngelHeart[{chat_id}]: 无法获取当前 provider，跳过图片过滤"
-                )
-                return contexts
-
-            # 检查 provider 的 modalities 配置
-            provider_config = provider.provider_config
-            modalities = provider_config.get("modalities", None)
-
-            if not modalities or not isinstance(modalities, list):
-                logger.debug(
-                    f"AngelHeart[{chat_id}]: Provider {provider_config.get('id', 'unknown')} 未声明 modalities，按兼容策略保留图片"
-                )
-                return contexts
-
-            # 如果支持图片，直接返回
-            if "image" in modalities:
-                logger.debug(
-                    f"AngelHeart[{chat_id}]: Provider {provider_config.get('id', 'unknown')} 支持图片，无需过滤"
-                )
-                return contexts
-
-            # 不支持图片，需要过滤
-            logger.info(
-                f"AngelHeart[{chat_id}]: Provider {provider_config.get('id', 'unknown')} 不支持图片，开始过滤图片内容"
-            )
-
-            filtered_contexts = []
-            images_filtered_count = 0
-
-            for msg in contexts:
-                filtered_msg = copy.deepcopy(msg)  # 深拷贝避免修改原始数据
-
-                if msg.get("role") == "user" and isinstance(
-                    filtered_msg.get("content"), list
-                ):
-                    original_content = filtered_msg["content"]
-                    filtered_content = []
-                    has_image = False
-
-                    for item in original_content:
-                        # 只处理字典类型的组件，保留 Pydantic 模型对象（如 ThinkPart）
-                        if isinstance(item, dict) and item.get("type") == "image_url":
-                            has_image = True
-                            images_filtered_count += 1
-                            # 静默移除图片，不添加任何提示
-                        else:
-                            # 保留非图片的所有组件（文本、ThinkPart、文件等）
-                            filtered_content.append(item)
-
-                    filtered_msg["content"] = filtered_content
-
-                    if has_image:
-                        logger.debug(
-                            f"AngelHeart[{chat_id}]: 已过滤用户消息中的图片内容"
-                        )
-
-                elif msg.get("role") == "assistant":
-                    # 对于 assistant 消息，强制将 content 转换为纯文本字符串
-                    content = filtered_msg.get("content", [])
-                    assistant_text = ""
-
-                    if isinstance(content, list):
-                        for item in content:
-                            # 只处理字典类型的文本组件
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                assistant_text += item.get("text", "")
-                    elif isinstance(content, str):
-                        assistant_text = content
-                    else:
-                        assistant_text = str(content)
-
-                    filtered_msg["content"] = assistant_text
-
-                filtered_contexts.append(filtered_msg)
-
-            if images_filtered_count > 0:
-                logger.info(
-                    f"AngelHeart[{chat_id}]: 总共过滤了 {images_filtered_count} 个图片组件"
-                )
-
-            return filtered_contexts
-
-        except Exception as e:
-            logger.error(
-                f"AngelHeart[{chat_id}]: 图片过滤时发生错误: {e}", exc_info=True
-            )
-            # 出错时返回原始上下文，避免破坏流程
-            return contexts
+        return contexts
 
     def _get_conversation_data(self, chat_id: str):
         """
@@ -1248,8 +1335,8 @@ class FrontDesk:
             return False
 
     def _should_preserve_current_image_urls(self, chat_id: str) -> bool:
-        """主模型支持图片时，当前事件图片保持 AstrBot 原生传递。"""
-        return self._provider_supports_images(chat_id)
+        """图片始终保留到 AstrBot 根据本轮最终 Provider 做能力清洗。"""
+        return True
 
     async def _ensure_image_captions_for_request(
         self, chat_id: str, force_caption: bool = False
@@ -1376,8 +1463,8 @@ class FrontDesk:
             req.prompt = final_prompt
             if preserve_current_image_urls:
                 self._append_extra_image_urls_to_request(req, extra_image_urls or [])
-            else:
-                req.image_urls = []
+            # 不在插件层清空当前图片。AstrBot 会依据最终选中的（含 fallback）
+            # Provider modalities 清洗请求；文本模型仍可使用上面生成的图片转述。
 
         # 注入系统提示词
         original_system_prompt = getattr(req, "system_prompt", "")
@@ -1405,7 +1492,9 @@ class FrontDesk:
 
         caption_count = await self._ensure_image_captions_for_request(
             chat_id,
-            force_caption=not preserve_current_image_urls,
+            # 路由、图片 fallback 和请求失败重试都可能改变最终 Provider。
+            # 始终为未转述图片生成一次缓存文本，保证纯文本终点也不丢信息。
+            force_caption=True,
         )
         if caption_count > 0:
             logger.info(

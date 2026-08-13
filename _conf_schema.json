@@ -13,6 +13,24 @@
     "_special": "select_provider",
     "default": ""
   },
+  "image_caption_prompt": {
+    "type": "text",
+    "description": "[核心模型] 图片转述提示词",
+    "hint": "指导 AngelHeart 的视觉模型描述图片；适合加入 OCR、表格及数值提取要求。",
+    "default": "请准确转述这张图片供纯文字主模型理解。描述整体与重要细节；如有文字、表格、数值或标签，请进行 OCR 并保留其结构与关系。不要猜测看不清的内容。"
+  },
+  "image_caption_timeout": {
+    "type": "float",
+    "description": "图片转述单次超时（秒）",
+    "hint": "限制图片转述阻塞主会话的时间，建议 15~30 秒。",
+    "default": 25.0
+  },
+  "image_caption_retry_cooldown": {
+    "type": "float",
+    "description": "图片转述失败冷却（秒）",
+    "hint": "失败后在冷却期内使用文字兜底，不重复请求转述模型。",
+    "default": 300.0
+  },
   "is_reasoning_model": {
     "type": "bool",
     "description": "[核心模型] 只输出 JSON",

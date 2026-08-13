@@ -41,6 +41,30 @@ class ConfigManager:
         return self._config.get("image_caption_provider_id", "")
 
     @property
+    def image_caption_prompt(self) -> str:
+        prompt = self._config.get("image_caption_prompt", "")
+        if isinstance(prompt, str) and prompt.strip():
+            return prompt.strip()
+        return "请准确转述这张图片供纯文字主模型理解。"
+
+    @property
+    def image_caption_timeout(self) -> float:
+        try:
+            return min(60.0, max(5.0, float(self._config.get("image_caption_timeout", 25.0))))
+        except (TypeError, ValueError):
+            return 25.0
+
+    @property
+    def image_caption_retry_cooldown(self) -> float:
+        try:
+            return min(
+                3600.0,
+                max(30.0, float(self._config.get("image_caption_retry_cooldown", 300.0))),
+            )
+        except (TypeError, ValueError):
+            return 300.0
+
+    @property
     def is_reasoning_model(self) -> bool:
         return self._config.get("is_reasoning_model", False)
 
@@ -61,6 +85,10 @@ class ConfigManager:
     @property
     def observation_timeout(self) -> int:
         return self._get_grouped("timing", "observation_timeout", 60)
+
+    @property
+    def familiarity_timeout(self) -> int:
+        return self._get_grouped("timing", "familiarity_timeout", self.observation_timeout)
 
     # ========== leave_reply ==========
 
