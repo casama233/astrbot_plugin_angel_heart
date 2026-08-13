@@ -128,6 +128,50 @@ class FrontDesk:
         except Exception:
             return ""
 
+    def _iter_image_components(self, components):
+        """遍历当前消息与引用消息中的图片组件。"""
+        pending = list(components or [])
+        seen_replies = set()
+
+        while pending:
+            component = pending.pop(0)
+            if isinstance(component, Image):
+                yield component
+                continue
+            if not isinstance(component, Reply):
+                continue
+
+            component_id = id(component)
+            if component_id in seen_replies:
+                continue
+            seen_replies.add(component_id)
+            quoted_chain = getattr(component, "chain", None)
+            if quoted_chain:
+                pending[0:0] = list(quoted_chain)
+
+    def _without_image_components(self, components, seen_replies=None):
+        """复制 Reply 外壳并移除当前消息与引用消息中的图片。"""
+        seen_replies = seen_replies or set()
+        sanitized = []
+        for component in components or []:
+            if isinstance(component, Image):
+                continue
+            if not isinstance(component, Reply):
+                sanitized.append(component)
+                continue
+
+            cloned_reply = copy.copy(component)
+            component_id = id(component)
+            if component_id in seen_replies:
+                cloned_reply.chain = []
+            else:
+                seen_replies.add(component_id)
+                cloned_reply.chain = self._without_image_components(
+                    getattr(component, "chain", None), seen_replies
+                )
+            sanitized.append(cloned_reply)
+        return sanitized
+
     async def cache_message(self, chat_id: str, event: AstrMessageEvent):
         """
         前台职责：使用消息概要作为主要正文，处理图片组件并缓存。
@@ -160,64 +204,63 @@ class FrontDesk:
         if text_content:
             content_list.append({"type": "text", "text": text_content})
 
-        # 4. 处理图片组件
-        for component in message_chain:
-            if isinstance(component, Image):
-                # 尝试使用官方方法处理本地文件或可访问的URL
-                try:
-                    # 检查是否是本地文件或可访问的URL
-                    url = component.url or component.file
-                    if url and (
-                        url.startswith("file:///")
-                        or url.startswith("base64://")
-                        or os.path.exists(url or "")
-                    ):
-                        # 对于本地文件，直接使用官方方法
-                        base64_data = await component.convert_to_base64()
-                        if base64_data:
-                            # 转换为 data URL 格式
-                            if base64_data.startswith("base64://"):
-                                image_data = base64_data.replace("base64://", "")
-                            else:
-                                image_data = base64_data
-                            data_url = f"data:image/jpeg;base64,{image_data}"
-                            content_list.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": data_url},
-                                    "original_url": url,  # 保存原始URL供转述使用
-                                    "original_file_url": url,  # 兼容下游统一读取字段
-                                }
-                            )
+        # 4. 处理当前消息及引用消息中的图片组件
+        for component in self._iter_image_components(message_chain):
+            # 尝试使用官方方法处理本地文件或可访问的URL
+            try:
+                # 检查是否是本地文件或可访问的URL
+                url = component.url or component.file
+                if url and (
+                    url.startswith("file:///")
+                    or url.startswith("base64://")
+                    or os.path.exists(url or "")
+                ):
+                    # 对于本地文件，直接使用官方方法
+                    base64_data = await component.convert_to_base64()
+                    if base64_data:
+                        # 转换为 data URL 格式
+                        if base64_data.startswith("base64://"):
+                            image_data = base64_data.replace("base64://", "")
                         else:
-                            raise Exception("convert_to_base64 返回空值")
+                            image_data = base64_data
+                        data_url = f"data:image/jpeg;base64,{image_data}"
+                        content_list.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                                "original_url": url,  # 保存原始URL供转述使用
+                                "original_file_url": url,  # 兼容下游统一读取字段
+                            }
+                        )
                     else:
-                        # 对于网络URL，尝试下载，如果失败则跳过
-                        base64_data = await component.convert_to_base64()
-                        if base64_data:
-                            # 转换为 data URL 格式
-                            if base64_data.startswith("base64://"):
-                                image_data = base64_data.replace("base64://", "")
-                            else:
-                                image_data = base64_data
-                            data_url = f"data:image/jpeg;base64,{image_data}"
-                            content_list.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": data_url},
-                                    "original_url": url,  # 保存原始URL供转述使用
-                                    "original_file_url": url,  # 兼容下游统一读取字段
-                                }
-                            )
+                        raise Exception("convert_to_base64 返回空值")
+                else:
+                    # 对于网络URL，尝试下载，如果失败则跳过
+                    base64_data = await component.convert_to_base64()
+                    if base64_data:
+                        # 转换为 data URL 格式
+                        if base64_data.startswith("base64://"):
+                            image_data = base64_data.replace("base64://", "")
                         else:
-                            raise Exception("网络图片下载失败")
-                except Exception as e:
-                    # 图片处理失败时，用文本占位符替换，避免传递空或无效URL
-                    original_url = component.url or component.file or "未知URL"
-                    logger.debug(
-                        f"AngelHeart[{chat_id}]: 图片处理跳过，URL: {original_url}, 原因: {str(e)[:100]}"
-                    )
-                    # 不添加任何内容，完全跳过图片，保持原有文本消息不变
+                            image_data = base64_data
+                        data_url = f"data:image/jpeg;base64,{image_data}"
+                        content_list.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                                "original_url": url,  # 保存原始URL供转述使用
+                                "original_file_url": url,  # 兼容下游统一读取字段
+                            }
+                        )
+                    else:
+                        raise Exception("网络图片下载失败")
+            except Exception as e:
+                # 图片处理失败时，用文本占位符替换，避免传递空或无效URL
+                original_url = component.url or component.file or "未知URL"
+                logger.debug(
+                    f"AngelHeart[{chat_id}]: 图片处理跳过，URL: {original_url}, 原因: {str(e)[:100]}"
+                )
+                # 不添加任何内容，完全跳过图片，保持原有文本消息不变
 
         # 5. 如果没有内容，创建一个空文本
         if not content_list:
@@ -330,7 +373,7 @@ class FrontDesk:
         从路由选中的文本模型切换到多模态 fallback。
         """
         message_chain = list(event.get_messages() or [])
-        if not any(isinstance(component, Image) for component in message_chain):
+        if not any(self._iter_image_components(message_chain)):
             return False
 
         caption_provider_id = self._config_manager.image_caption_provider_id
@@ -396,11 +439,7 @@ class FrontDesk:
                     ),
                 },
             )
-        event.message_obj.message = [
-            component
-            for component in message_chain
-            if not isinstance(component, Image)
-        ]
+        event.message_obj.message = self._without_image_components(message_chain)
         event.message_obj.message.append(Plain(caption_text))
         event.message_str = request_text
         if hasattr(event.message_obj, "message_str"):

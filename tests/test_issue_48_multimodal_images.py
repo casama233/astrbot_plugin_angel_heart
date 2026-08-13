@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from astrbot_plugin_angel_heart.core.utils.context_utils import format_final_prompt
 from astrbot_plugin_angel_heart.core.conversation_ledger import ConversationLedger
 from astrbot_plugin_angel_heart.roles.front_desk import FrontDesk
-from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.components import Image, Plain, Reply
 
 
 _DEFAULT_MODALITIES = object()
@@ -180,6 +180,45 @@ def test_temporary_caption_failure_stays_with_text_model_and_reports_failure():
     assert front_desk.restore_original_image_event(event) is True
     assert message_obj.message == [image]
     assert event.message_str == ""
+
+
+def test_quoted_image_is_captioned_and_removed_from_temporary_request():
+    event_id = "ah-quoted"
+    ledger = _EarlyCaptionLedger(event_id, "引用图片中是一张天气预报")
+    front_desk = object.__new__(FrontDesk)
+    front_desk._config_manager = SimpleNamespace(
+        image_caption_provider_id="vision-provider"
+    )
+    front_desk.astr_context = SimpleNamespace()
+    front_desk.context = SimpleNamespace(conversation_ledger=ledger)
+
+    image = Image()
+    reply = Reply(chain=[Plain("引用正文"), image])
+    question = Plain("这张图是什么？")
+    message_obj = SimpleNamespace(message=[reply, question], message_str="")
+    extras = {}
+    event = SimpleNamespace(
+        unified_msg_origin="whatsapp:FriendMessage:1",
+        angelheart_event_id=event_id,
+        message_obj=message_obj,
+        message_str="这张图是什么？",
+        get_messages=lambda: message_obj.message,
+        set_extra=lambda key, value: extras.__setitem__(key, value),
+        get_extra=lambda key, default=None: extras.get(key, default),
+    )
+
+    changed = asyncio.run(front_desk.prepare_current_image_for_text_model(event))
+
+    assert changed is True
+    assert ledger.generated == 1
+    sanitized_reply = message_obj.message[0]
+    assert isinstance(sanitized_reply, Reply)
+    assert all(not isinstance(component, Image) for component in sanitized_reply.chain)
+    assert "引用图片中是一张天气预报" in event.message_str
+
+    assert front_desk.restore_original_image_event(event) is True
+    assert message_obj.message == [reply, question]
+    assert reply.chain[1] is image
 
 
 def test_multiple_images_are_all_captioned_before_text_only_routing():
