@@ -35,7 +35,8 @@ class Plain:
 
 
 class Reply:
-    pass
+    def __init__(self, chain=None):
+        self.chain = chain
 
 
 class ImageURLPart:
