@@ -84,6 +84,31 @@ jobs:
               )
               main_path.write_text(main, encoding="utf-8")
 
+          front_path = Path("roles/front_desk.py")
+          front = front_path.read_text(encoding="utf-8")
+          reply_fallback_marker = '                # 兼容非 strict At 类型\n'
+          reply_fallback_patch = (
+              '                # 兼容不同 AstrBot／测试桩中的 Reply 类型身份。\n'
+              '                reply_sender_id = str(\n'
+              '                    getattr(component, "sender_id", "") or ""\n'
+              '                )\n'
+              '                component_name = component.__class__.__name__.casefold()\n'
+              '                if reply_sender_id == self_id and (\n'
+              '                    isinstance(component, Reply) or "reply" in component_name\n'
+              '                ):\n'
+              '                    is_at_self = True\n'
+              '                    break\n'
+          )
+          if "component_name = component.__class__.__name__.casefold()" not in front:
+              if front.count(reply_fallback_marker) != 1:
+                  raise SystemExit("Reply fallback marker is not unique; refusing to patch")
+              front = front.replace(
+                  reply_fallback_marker,
+                  reply_fallback_patch + reply_fallback_marker,
+                  1,
+              )
+              front_path.write_text(front, encoding="utf-8")
+
       - name: Install regression dependencies
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip
@@ -104,9 +129,6 @@ jobs:
           git diff --check
           git config user.name "Cary maintenance bot"
           git config user.email "97009482+casama233@users.noreply.github.com"
-          git add core/config_manager.py main.py .github/workflows/cary-one-shot-patch.yml
-          if git diff --cached --quiet; then
-            echo "No source changes required; only removing one-shot workflow if tracked."
-          fi
-          git commit -m "fix(P1): restore timeout and streaming send-state regressions"
+          git add core/config_manager.py main.py roles/front_desk.py .github/workflows/cary-one-shot-patch.yml
+          git commit -m "fix(P1): close Angel Heart release regressions"
           git push origin HEAD:cary/2.2.3
