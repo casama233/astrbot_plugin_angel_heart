@@ -357,6 +357,16 @@ class FrontDesk:
                 if isinstance(component, Reply) and str(component.sender_id or "") == self_id:
                     is_at_self = True
                     break
+                # 兼容不同 AstrBot／测试桩中的 Reply 类型身份。
+                reply_sender_id = str(
+                    getattr(component, "sender_id", "") or ""
+                )
+                component_name = component.__class__.__name__.casefold()
+                if reply_sender_id == self_id and (
+                    isinstance(component, Reply) or "reply" in component_name
+                ):
+                    is_at_self = True
+                    break
                 # 兼容非 strict At 类型
                 qq = getattr(component, "qq", None)
                 cls_name = component.__class__.__name__
