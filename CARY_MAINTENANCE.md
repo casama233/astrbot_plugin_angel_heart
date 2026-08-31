@@ -14,10 +14,22 @@
 |---|---:|---|
 | `fix/consecutive-echo-detection` | 已包含 | 保留新版連續純文字復讀判斷，不合併舊分支 |
 | `fix/familiarity-timeout-property` | 已包含 | 保留 grouped-config accessor，不合併舊分支 |
-| `codex/streaming-send-state` | 程式已包含 | 補回 `_has_send_oper` 空鏈回歸測試 |
+| `codex/streaming-send-state` | 已包含 | `_has_send_oper` 即使結果鏈為空也會完成發送狀態收口 |
 | 舊 `cancel_patience_timer` 清理 | 已包含 | 保留 v2 雙防抖狀態收口測試 |
 | `agent/fix-quoted-media-cache` | 原先缺失 | 以 `roles/cary_front_desk_patch.py` 最小兼容層移植 |
+| reply-to-self wake | 已修復 | 引用機器人自己時統一標記 `is_at_self`，並保留跨 AstrBot 元件身份兼容 |
 | `custom/cary-production-0.9` | 已過時且落後 | 僅作歷史參考，禁止直接 merge |
+
+## 回歸收口紀錄
+
+`2.2.3+cary.1` 合入正式部署分支前，已針對以下遺漏進行一次性修補並通過完整 286 項 pytest：
+
+- 補回 `ConfigManager.familiarity_timeout` grouped-config accessor；
+- 串流已實際發送但結果鏈為空時，仍正確完成在場狀態與工作 ledger 收口；
+- 回覆機器人自己的訊息可正確觸發喚醒；
+- 引用圖片及文字附件可進入媒體快取，且不產生循環遞迴。
+
+一次性修補 workflow 已在成功提交後自動移除，不屬於長期發版鏈。
 
 ## 引用附件補丁的邊界
 
