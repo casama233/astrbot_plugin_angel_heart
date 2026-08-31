@@ -1,0 +1,112 @@
+name: Angel Heart Cary one-shot patch
+
+on:
+  push:
+    branches:
+      - "cary/2.2.3"
+    paths:
+      - ".github/workflows/cary-one-shot-patch.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: angel-heart-cary-one-shot
+  cancel-in-progress: false
+
+jobs:
+  patch-and-verify:
+    if: github.actor == 'casama233'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out exact Cary branch
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: cary/2.2.3
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Apply bounded source patches
+        shell: python
+        run: |
+          from pathlib import Path
+
+          config_path = Path("core/config_manager.py")
+          config = config_path.read_text(encoding="utf-8")
+          timeout_marker = (
+              '    @property\n'
+              '    def observation_timeout(self) -> int:\n'
+              '        return self._get_grouped("timing", "observation_timeout", 60)\n'
+          )
+          timeout_patch = (
+              '\n    @property\n'
+              '    def familiarity_timeout(self) -> int:\n'
+              '        return self._get_grouped(\n'
+              '            "timing", "familiarity_timeout", self.observation_timeout\n'
+              '        )\n'
+          )
+          if "def familiarity_timeout" not in config:
+              if config.count(timeout_marker) != 1:
+                  raise SystemExit("observation_timeout marker is not unique; refusing to patch")
+              config = config.replace(timeout_marker, timeout_marker + timeout_patch, 1)
+              config_path.write_text(config, encoding="utf-8")
+
+          main_path = Path("main.py")
+          main = main_path.read_text(encoding="utf-8")
+          old_send_gate = (
+              '            result = event.get_result()\n'
+              '            if result and result.chain:\n'
+          )
+          new_send_gate = (
+              '            result = event.get_result()\n'
+              '            has_sent_message = bool(\n'
+              '                (result and result.chain)\n'
+              '                or getattr(event, "_has_send_oper", False)\n'
+              '            )\n'
+              '            if has_sent_message:\n'
+          )
+          if "has_sent_message = bool(" not in main:
+              if main.count(old_send_gate) != 1:
+                  raise SystemExit("after_message_sent gate is not unique; refusing to patch")
+              main = main.replace(old_send_gate, new_send_gate, 1)
+              main = main.replace(
+                  'logger.debug(f"AngelHeart[{chat_id}]: 消息链为空，跳过状态转换")',
+                  'logger.debug(f"AngelHeart[{chat_id}]: 未检测到实际消息发送，跳过状态转换")',
+                  1,
+              )
+              main_path.write_text(main, encoding="utf-8")
+
+      - name: Install regression dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install -r requirements.txt pytest pytest-asyncio PyYAML
+
+      - name: Compile and run full regression suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}/..
+        run: |
+          python -m compileall -q core roles tests main.py
+          python -m pytest -q tests
+
+      - name: Commit verified patch and remove this workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/cary-one-shot-patch.yml
+          git diff --check
+          git config user.name "Cary maintenance bot"
+          git config user.email "97009482+casama233@users.noreply.github.com"
+          git add core/config_manager.py main.py .github/workflows/cary-one-shot-patch.yml
+          if git diff --cached --quiet; then
+            echo "No source changes required; only removing one-shot workflow if tracked."
+          fi
+          git commit -m "fix(P1): restore timeout and streaming send-state regressions"
+          git push origin HEAD:cary/2.2.3
