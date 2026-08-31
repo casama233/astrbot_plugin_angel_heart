@@ -1,5 +1,12 @@
+"""AngelHeart 角色模块。
+
+FrontDesk 保留上游主体；Cary 维护层只安装经过回归测试的最小兼容补丁，
+避免把大型上游文件复制成难以审计的第二份实现。
 """
-AngelHeart 插件角色模块初始化文件。
-此模块包含前台 (FrontDesk) 和秘书 (Secretary) 两个核心角色的实现。
-"""
-# 可以在这里添加包级别的初始化代码或文档字符串
+
+from .front_desk import FrontDesk
+from .cary_front_desk_patch import install_quoted_media_cache_patch
+
+install_quoted_media_cache_patch(FrontDesk)
+
+__all__ = ["FrontDesk"]

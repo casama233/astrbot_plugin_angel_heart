@@ -1,0 +1,131 @@
+name: Angel Heart Cary release gate
+
+on:
+  push:
+    branches:
+      - master
+      - cary/2.2.3
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "**/*.py"
+      - "metadata.yaml"
+      - "requirements.txt"
+      - "webui/**"
+      - "pages/chat-config/**"
+      - "CARY_MAINTENANCE.md"
+      - ".github/workflows/angel-heart-cary-release.yml"
+      - ".pre-commit-config.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: angel-heart-cary-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out exact workflow revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: astrbot_plugin_angel_heart
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: astrbot_plugin_angel_heart/requirements.txt
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install \
+            -r astrbot_plugin_angel_heart/requirements.txt \
+            pytest \
+            pytest-asyncio \
+            PyYAML
+
+      - name: Compile plugin sources
+        run: |
+          python -m compileall -q \
+            astrbot_plugin_angel_heart/core \
+            astrbot_plugin_angel_heart/roles \
+            astrbot_plugin_angel_heart/tests \
+            astrbot_plugin_angel_heart/main.py
+
+      - name: Verify tracked package hygiene
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          root = Path("astrbot_plugin_angel_heart")
+          tracked = subprocess.check_output(
+              ["git", "-C", str(root), "ls-files"],
+              text=True,
+          ).splitlines()
+          forbidden = [
+              path
+              for path in tracked
+              if "/.venv/" in f"/{path}/"
+              or "/node_modules/" in f"/{path}/"
+              or "/__pycache__/" in f"/{path}/"
+              or path.endswith((".pyc", ".pyo"))
+          ]
+          if forbidden:
+              raise SystemExit("禁止追踪的生成文件：\n" + "\n".join(forbidden))
+          PY
+
+      - name: Run complete regression suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest -q astrbot_plugin_angel_heart/tests
+
+  webui-build:
+    name: Rebuild committed WebUI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out exact workflow revision
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: astrbot_plugin_angel_heart
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: astrbot_plugin_angel_heart/webui/package-lock.json
+
+      - name: Install and build from lockfile
+        working-directory: astrbot_plugin_angel_heart/webui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify committed build is reproducible
+        working-directory: astrbot_plugin_angel_heart
+        run: |
+          status="$(git status --porcelain -- pages/chat-config)"
+          if [ -n "$status" ]; then
+            echo "WebUI build output differs from the committed package:"
+            printf '%s\n' "$status"
+            git diff -- pages/chat-config || true
+            exit 1
+          fi
