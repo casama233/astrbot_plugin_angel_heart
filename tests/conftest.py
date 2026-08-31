@@ -26,10 +26,28 @@ class FunctionTool:
 
 
 class At:
-    pass
+    def __init__(self, qq="", name="", **kwargs):
+        self.qq = qq
+        self.name = name
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class Image:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class File(Image):
+    pass
+
+
+class Record(Image):
+    pass
+
+
+class Video(Image):
     pass
 
 
@@ -44,11 +62,19 @@ class File:
 
 
 class Plain:
-    pass
+    def __init__(self, text=""):
+        self.text = text
 
 
 class Reply:
-    pass
+    def __init__(self, **kwargs):
+        self.id = kwargs.pop("id", "")
+        self.chain = kwargs.pop("chain", [])
+        self.sender_id = kwargs.pop("sender_id", "")
+        self.sender_nickname = kwargs.pop("sender_nickname", "")
+        self.message_str = kwargs.pop("message_str", "")
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
 
 class ImageURLPart:
@@ -70,7 +96,9 @@ astrbot_components_module.At = At
 astrbot_components_module.File = File
 astrbot_components_module.Image = Image
 astrbot_components_module.Plain = Plain
+astrbot_components_module.Record = Record
 astrbot_components_module.Reply = Reply
+astrbot_components_module.Video = Video
 astrbot_core_agent_message_module.ImageURLPart = ImageURLPart
 
 sys.modules.setdefault("astrbot", astrbot_module)

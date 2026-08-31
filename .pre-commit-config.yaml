@@ -1,0 +1,10 @@
+minimum_pre_commit_version: "3.5.0"
+
+repos:
+  - repo: local
+    hooks:
+      - id: cary-python-compile
+        name: Compile Angel Heart Python sources
+        entry: python -m compileall -q core roles tests main.py
+        language: system
+        pass_filenames: false
