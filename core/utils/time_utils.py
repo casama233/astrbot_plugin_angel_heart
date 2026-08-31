@@ -15,6 +15,10 @@ except ImportError:
 # 定义默认时间戳回退时间（1小时），用于当消息没有时间戳时提供一个基准时间
 DEFAULT_TIMESTAMP_FALLBACK_SECONDS = 3600
 
+# AngelHeart 的消息提示词与现有配置均以东八区时间为准。固定时区可避免
+# Docker、GitHub Actions 或海外服务器的系统时区改变同一消息的显示结果。
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+
 
 def get_latest_message_time(messages: list[dict]) -> float:
     """
@@ -92,9 +96,7 @@ def get_beijing_time_str() -> str:
     获取当前的东八区（北京）时间字符串。
     格式: YYYY-MM-DD HH:MM:SS (周X)
     """
-    # 创建东八区时区
-    beijing_tz = timezone(timedelta(hours=8))
-    now = datetime.now(beijing_tz)
+    now = datetime.now(BEIJING_TIMEZONE)
 
     # 格式化时间
     time_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -108,13 +110,13 @@ def get_beijing_time_str() -> str:
 
 def format_absolute_time(timestamp: float) -> str:
     """
-    将 Unix 时间戳格式化为绝对时间字符串（精确到分钟）。
+    将 Unix 时间戳格式化为东八区绝对时间字符串（精确到分钟）。
 
     Args:
         timestamp (float): Unix 时间戳。
 
     Returns:
-        str: 形如 " (YYYY-MM-DD HH:MM)"，按系统当地时区格式化；时间无效时返回空字符串。
+        str: 形如 " (YYYY-MM-DD HH:MM)"；时间无效时返回空字符串。
     """
     if not timestamp:
         return ""
@@ -128,7 +130,9 @@ def format_absolute_time(timestamp: float) -> str:
         return ""
 
     try:
-        msg_dt = datetime.fromtimestamp(timestamp).astimezone()
+        msg_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(
+            BEIJING_TIMEZONE
+        )
         return f" ({msg_dt.strftime('%Y-%m-%d %H:%M')})"
     except (OverflowError, OSError, ValueError):
         return ""
