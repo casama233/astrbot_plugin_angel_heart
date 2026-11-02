@@ -1,5 +1,7 @@
 # AngelHeart - 智能群聊/私聊交互插件
 
+**简体中文** · [繁體中文](README.zh-TW.md) · [English](README.en.md)
+
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![AstrBot Plugin](https://img.shields.io/badge/AstrBot-Plugin-blue)](https://github.com/Soulter/AstrBot)
 
